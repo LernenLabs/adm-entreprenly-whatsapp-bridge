@@ -1,0 +1,13 @@
+services:
+  bridge:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    env_file: .env
+    volumes:
+      # Keeps the WhatsApp session so the QR does not have to be scanned again after a restart.
+      - wwebjs_auth:/app/.wwebjs_auth
+
+volumes:
+  wwebjs_auth:
