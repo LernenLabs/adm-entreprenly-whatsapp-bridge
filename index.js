@@ -66,6 +66,26 @@ async function callBackend(path, body) {
   }
 }
 
+/**
+ * Downloads an incoming image. WhatsApp Web often has not finished fetching the media when
+ * the 'message' event fires, so downloadMedia() can return nothing on the first try.
+ */
+async function downloadReceipt(msg, email, fromPhone) {
+  const waits = [0, 2000, 5000];
+  for (let attempt = 0; attempt < waits.length; attempt++) {
+    if (waits[attempt]) await new Promise(resolve => setTimeout(resolve, waits[attempt]));
+    try {
+      const media = await msg.downloadMedia();
+      if (media?.data) return media;
+      console.warn(`[whatsapp:${email}] Imagen de ${fromPhone} vacía (intento ${attempt + 1})`);
+    } catch (err) {
+      console.warn(`[whatsapp:${email}] Error descargando imagen de ${fromPhone} (intento ${attempt + 1}):`, err.message);
+    }
+  }
+  console.warn(`[whatsapp:${email}] No se pudo descargar la imagen de ${fromPhone}`);
+  return null;
+}
+
 // ── Session factory ───────────────────────────────────────────────────────────
 
 async function initSession(email, sellerId = 1, businessName = 'Mi Negocio') {
@@ -142,18 +162,23 @@ async function initSession(email, sellerId = 1, businessName = 'Mi Negocio') {
     if (msg.fromMe || msg.from === 'status@broadcast' || msg.from.endsWith('@g.us')) return;
 
     const fromPhone = toPhone(msg.from);
+    console.log(`[whatsapp:${email}] Llegó ${msg.type} de ${fromPhone} (media: ${msg.hasMedia})`);
 
     // Payment receipt image.
     if (msg.hasMedia && (msg.type === 'image' || msg.type === 'document')) {
       try {
-        const media = await msg.downloadMedia();
-        if (media?.data) {
-          const image = `data:${media.mimetype};base64,${media.data}`;
-          console.log(`[whatsapp:${email}] Comprobante de ${fromPhone}`);
-          const reply = await callBackend('/chatbot/whatsapp/webhook/receipt',
-            { fromPhone, ownerEmail: email, image });
-          if (reply?.content) await client.sendMessage(msg.from, reply.content);
+        const media = await downloadReceipt(msg, email, fromPhone);
+        if (!media) {
+          // Never drop a receipt silently: the client would wait for an answer that never comes.
+          await client.sendMessage(msg.from, 'No pude leer tu imagen. ¿Puedes enviarla de nuevo?');
+          return;
         }
+        const image = `data:${media.mimetype};base64,${media.data}`;
+        console.log(`[whatsapp:${email}] Comprobante de ${fromPhone} (${Math.round(media.data.length / 1024)} KB)`);
+        const reply = await callBackend('/chatbot/whatsapp/webhook/receipt',
+          { fromPhone, ownerEmail: email, image });
+        if (!reply) console.warn(`[whatsapp:${email}] El backend no recibió el comprobante de ${fromPhone}`);
+        if (reply?.content) await client.sendMessage(msg.from, reply.content);
       } catch (err) {
         console.warn(`[whatsapp:${email}] Error procesando comprobante:`, err.message);
       }
