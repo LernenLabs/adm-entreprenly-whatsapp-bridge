@@ -79,7 +79,7 @@ async function downloadReceipt(msg, email, fromPhone) {
       if (media?.data) return media;
       console.warn(`[whatsapp:${email}] Imagen de ${fromPhone} vacía (intento ${attempt + 1})`);
     } catch (err) {
-      console.warn(`[whatsapp:${email}] Error descargando imagen de ${fromPhone} (intento ${attempt + 1}):`, err.message);
+      console.warn(`[whatsapp:${email}] Error descargando imagen de ${fromPhone} (intento ${attempt + 1}):`, err);
     }
   }
   console.warn(`[whatsapp:${email}] No se pudo descargar la imagen de ${fromPhone}`);
