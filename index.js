@@ -17,9 +17,38 @@
  */
 
 require('dotenv').config();
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
 const qrcode = require('qrcode');
 const qrcodeTerminal = require('qrcode-terminal');
+
+/**
+ * Backport for whatsapp-web.js 1.34.7 (wwebjs/whatsapp-web.js#201908): downloadMedia() does
+ * not forward the message's mimetype, so current WhatsApp Web builds reject every uncached
+ * image with InvalidMediaFileType (an opaque "t: t" in Node). Runs before the library is
+ * loaded and stands down once an installed version already passes the mimetype.
+ */
+function patchMediaDownloadMimetype() {
+  const anchor = /( *)type: msg\.type,\n( *)signal: new AbortController\(\)\.signal,/;
+  try {
+    const file = path.join(path.dirname(require.resolve('whatsapp-web.js/package.json')),
+      'src', 'structures', 'Message.js');
+    const source = fs.readFileSync(file, 'utf8');
+    if (/type: msg\.type,\n *mimetype: msg\.mimetype,/.test(source)) return;
+    if (!anchor.test(source)) {
+      console.warn('[bridge] Parche de mimetype no aplicado: whatsapp-web.js cambió, revisar downloadMedia()');
+      return;
+    }
+    fs.writeFileSync(file, source.replace(anchor,
+      '$1type: msg.type,\n$1mimetype: msg.mimetype,\n$2signal: new AbortController().signal,'));
+    console.log('[bridge] Parche de mimetype aplicado a whatsapp-web.js');
+  } catch (err) {
+    console.warn('[bridge] No se pudo aplicar el parche de mimetype:', err.message);
+  }
+}
+patchMediaDownloadMimetype();
+
 const { Client, LocalAuth } = require('whatsapp-web.js');
 
 // Two backends share one WhatsApp session via a manual "turn": only the active
@@ -71,6 +100,14 @@ async function callBackend(path, body) {
  * the 'message' event fires, so downloadMedia() can return nothing on the first try.
  */
 async function downloadReceipt(msg, email, fromPhone) {
+  // WhatsApp Web (2026-07) exposes the serialized message id as "$1" instead of "_serialized",
+  // so whatsapp-web.js looks the message up with an undefined id and fails with an opaque
+  // "r: r" (wwebjs/whatsapp-web.js#201830). Restore it before downloading.
+  const id = msg.id;
+  if (id && !id._serialized) {
+    id._serialized = id.$1 || `${id.fromMe}_${id.remote}_${id.id}`;
+  }
+
   const waits = [0, 2000, 5000];
   for (let attempt = 0; attempt < waits.length; attempt++) {
     if (waits[attempt]) await new Promise(resolve => setTimeout(resolve, waits[attempt]));
