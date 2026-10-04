@@ -73,6 +73,42 @@ const BROWSER_PATH = process.env.WHATSAPP_BROWSER_PATH || undefined;
 const sessions    = new Map();
 const initializing = new Set(); // guard against duplicate init
 
+// ── Persisted bridge state ──────────────────────────────────────────────────
+// Lives next to the WhatsApp sessions, inside the Docker volume, so it survives restarts:
+//   sessions: email → { sellerId, businessName }   sessions to reopen on startup
+//   chatIds : phone → chatId                       real chat of each client (see /send)
+const STATE_FILE = path.join(__dirname, '.wwebjs_auth', 'bridge-state.json');
+const persisted  = loadPersistedState();
+
+function loadPersistedState() {
+  try {
+    const data = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    return { sessions: data.sessions || {}, chatIds: data.chatIds || {} };
+  } catch {
+    return { sessions: {}, chatIds: {} };
+  }
+}
+
+function savePersistedState() {
+  try {
+    fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+    fs.writeFileSync(STATE_FILE, JSON.stringify(persisted, null, 2));
+  } catch (err) {
+    console.warn('[bridge] No se pudo guardar el estado:', err.message);
+  }
+}
+
+/**
+ * WhatsApp addresses some clients by LID ("…@lid") instead of their phone, so the "+digits"
+ * the backend stores is not always a real phone and "<digits>@c.us" fails with "No LID for
+ * user". Remember the chat each client actually wrote from and reply there.
+ */
+function rememberChatId(phone, chatId) {
+  if (!phone || !chatId || persisted.chatIds[phone] === chatId) return;
+  persisted.chatIds[phone] = chatId;
+  savePersistedState();
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function toPhone(jid) {
@@ -152,6 +188,9 @@ async function initSession(email, sellerId = 1, businessName = 'Mi Negocio') {
   // Store before initialize() so /qr can return immediately.
   sessions.set(email, { client, state, sellerId, businessName });
   initializing.delete(email);
+  // Reopened automatically when the bridge restarts (see app.listen).
+  persisted.sessions[email] = { sellerId, businessName };
+  savePersistedState();
 
   client.on('qr', async (qr) => {
     state.qr        = qr;
@@ -185,6 +224,11 @@ async function initSession(email, sellerId = 1, businessName = 'Mi Negocio') {
     console.warn(`[whatsapp:${email}] Desconectado: ${reason}`);
     state.connected = false;
     state.qr        = null;
+    // Unlinked from the phone: do not reopen it on the next start.
+    if (reason === 'LOGOUT') {
+      delete persisted.sessions[email];
+      savePersistedState();
+    }
     await callBackend('/chatbot/whatsapp/bridge/status', {
       connected   : false,
       phone       : state.phone,
@@ -199,6 +243,7 @@ async function initSession(email, sellerId = 1, businessName = 'Mi Negocio') {
     if (msg.fromMe || msg.from === 'status@broadcast' || msg.from.endsWith('@g.us')) return;
 
     const fromPhone = toPhone(msg.from);
+    rememberChatId(fromPhone, msg.from);
     console.log(`[whatsapp:${email}] Llegó ${msg.type} de ${fromPhone} (media: ${msg.hasMedia})`);
 
     // Payment receipt image.
@@ -310,9 +355,16 @@ app.post('/send', async (req, res) => {
   const digits = String(phone).replace(/\D/g, '');
   if (!digits) return res.status(400).json({ error: 'teléfono inválido' });
 
+  // The chat the client wrote from (LID-safe); otherwise ask WhatsApp for the phone's chat.
+  let chatId = persisted.chatIds[`+${digits}`];
+  if (!chatId) {
+    const numberId = await session.client.getNumberId(digits).catch(() => null);
+    chatId = numberId?._serialized || numberId?.$1 || `${digits}@c.us`;
+  }
+
   try {
-    await session.client.sendMessage(`${digits}@c.us`, String(content));
-    console.log(`[bridge:${email}] Mensaje enviado a +${digits}`);
+    await session.client.sendMessage(chatId, String(content));
+    console.log(`[bridge:${email}] Mensaje enviado a +${digits} (${chatId})`);
     res.json({ ok: true });
   } catch (err) {
     console.warn(`[bridge:${email}] No se pudo enviar a +${digits}:`, err.message);
@@ -431,4 +483,12 @@ app.listen(PORT, () => {
   console.log(`[bridge] Backends → DAOP: ${BACKENDS.daop} | AP: ${BACKENDS.ap}`);
   console.log(`[bridge] Turno activo: ${activeBackend} (${backendUrl()})`);
   console.log(`[bridge] Estado: http://localhost:${PORT}  ·  Cambiar turno: http://localhost:${PORT}/switch`);
+
+  // Reopen the sessions that were linked before the restart: otherwise client messages are
+  // ignored until a seller happens to open the app and the backend asks for a QR again.
+  for (const [email, { sellerId, businessName }] of Object.entries(persisted.sessions)) {
+    console.log(`[bridge] Restaurando sesión de ${email}`);
+    initSession(email, sellerId, businessName)
+      .catch(err => console.error(`[bridge] No se pudo restaurar ${email}:`, err));
+  }
 });
