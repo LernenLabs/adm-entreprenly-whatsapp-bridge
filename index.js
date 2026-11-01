@@ -51,6 +51,24 @@ patchMediaDownloadMimetype();
 
 const { Client, LocalAuth } = require('whatsapp-web.js');
 
+/**
+ * whatsapp-web.js 1.34.7 injects as soon as window.Debug.VERSION exists, but WhatsApp Web can
+ * still resolve WAWebSocketModel to null at that point, which rejects initialize() with
+ * "Cannot read properties of null (reading 'Socket')". Wait for the module first.
+ */
+class BridgeClient extends Client {
+  async inject() {
+    const deadline = Date.now() + 60_000;
+    while (Date.now() < deadline) {
+      const ready = await this.pupPage.evaluate(() => !!window.require('WAWebSocketModel')?.Socket)
+        .catch(() => false); // Page still loading or navigating: try again.
+      if (ready) break;
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+    return super.inject();
+  }
+}
+
 // Two backends share one WhatsApp session via a manual "turn": only the active
 // backend receives and answers incoming messages at any given time. The turn is
 // changed from the /switch page.
@@ -170,7 +188,7 @@ async function initSession(email, sellerId = 1, businessName = 'Mi Negocio') {
   // Each seller gets its own auth folder so sessions are fully independent.
   const clientId = `seller-${email.replace(/[^a-z0-9]/gi, '-')}`;
 
-  const client = new Client({
+  const client = new BridgeClient({
     authStrategy: new LocalAuth({ clientId }),
     puppeteer: {
       headless: true,
@@ -294,7 +312,13 @@ async function initSession(email, sellerId = 1, businessName = 'Mi Negocio') {
     }
   });
 
-  client.initialize();
+  // A failed start must not take down the bridge and the other sellers' sessions.
+  client.initialize().catch(async (err) => {
+    console.error(`[whatsapp:${email}] No se pudo iniciar, reintentando en 15 s:`, err?.message || err);
+    sessions.delete(email);
+    await client.destroy().catch(() => {});
+    setTimeout(() => initSession(email, sellerId, businessName), 15_000);
+  });
 }
 
 // ── Express app ───────────────────────────────────────────────────────────────
